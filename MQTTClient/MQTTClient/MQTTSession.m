@@ -294,15 +294,43 @@ NSString * const MQTTSessionErrorDomain = @"MQTT";
                                           correlationData:nil
                                              userProperty:nil
                                               contentType:nil];
-                flow = [self.persistence storeMessageForClientId:self.clientId
-                                                           topic:topic
-                                                            data:data
-                                                      retainFlag:retainFlag
-                                                             qos:qos
-                                                           msgId:msgId
-                                                    incomingFlag:NO
-                                                     commandType:MQTTPublish
-                                                        deadline:[NSDate dateWithTimeIntervalSinceNow:self.dupTimeout]];
+                // QoS1で、かつdupTimeoutが0以下の場合は、Ackを待たずに終了処理を行う
+                if (self.dupTimeout <= 0 && qos == MQTTQosLevelAtLeastOnce) {
+                    NSError *error = nil;
+                    if (![self encode:msg]) {
+                        error = [NSError errorWithDomain:MQTTSessionErrorDomain
+                                                    code:MQTTSessionErrorEncoderNotReady
+                                                userInfo:@{NSLocalizedDescriptionKey : @"Encoder not ready"}];
+                    } else {
+                        if ([self.delegate respondsToSelector:@selector(messageDelivered:msgID:)]) {
+                            [self.delegate messageDelivered:self msgID:msgId];
+                        }
+                        if ([self.delegate respondsToSelector:@selector(messageDelivered:msgID:topic:data:qos:retainFlag:)]) {
+                            [self.delegate messageDelivered:self
+                                                      msgID:msgId
+                                                      topic:topic
+                                                       data:data
+                                                        qos:qos
+                                                 retainFlag:retainFlag];
+                        }
+                        if (self.synchronPub && self.synchronPubMid == msgId) {
+                            self.synchronPub = FALSE;
+                        }
+                    }
+                    if (publishHandler) {
+                        [self onPublish:publishHandler error:error];
+                    }
+                } else {
+                    flow = [self.persistence storeMessageForClientId:self.clientId
+                                                               topic:topic
+                                                                data:data
+                                                          retainFlag:retainFlag
+                                                                 qos:qos
+                                                               msgId:msgId
+                                                        incomingFlag:NO
+                                                         commandType:MQTTPublish
+                                                            deadline:[NSDate dateWithTimeIntervalSinceNow:self.dupTimeout]];
+                }
             }
         }
         if (!msg) {
@@ -317,14 +345,16 @@ NSString * const MQTTSessionErrorDomain = @"MQTT";
                                                     deadline:[NSDate date]];
         }
         if (!flow) {
-            DDLogWarn(@"[MQTTSession] dropping outgoing message %d", msgId);
-            NSError *error = [NSError errorWithDomain:MQTTSessionErrorDomain
-                                                 code:MQTTSessionErrorDroppingOutgoingMessage
-                                             userInfo:@{NSLocalizedDescriptionKey : @"Dropping outgoing Message"}];
-            if (publishHandler) {
-                [self onPublish:publishHandler error:error];
+            if (!(self.dupTimeout <= 0 && qos == MQTTQosLevelExactlyOnce)) {
+                DDLogWarn(@"[MQTTSession] dropping outgoing message %d", msgId);
+                NSError *error = [NSError errorWithDomain:MQTTSessionErrorDomain
+                                                     code:MQTTSessionErrorDroppingOutgoingMessage
+                                                 userInfo:@{NSLocalizedDescriptionKey : @"Dropping outgoing Message"}];
+                if (publishHandler) {
+                    [self onPublish:publishHandler error:error];
+                }
+                msgId = 0;
             }
-            msgId = 0;
         } else {
             [self.persistence sync];
             if (publishHandler) {
@@ -503,11 +533,43 @@ NSString * const MQTTSessionErrorDomain = @"MQTT";
                                                       correlationData:nil
                                                          userProperty:nil
                                                           contentType:nil];
-                        if ([self encode:message]) {
-                            flow.commandType = @(MQTTPublish);
-                            flow.deadline = [NSDate dateWithTimeIntervalSinceNow:self.dupTimeout];
+                        // QoS1で、かつdupTimeoutが0以下の場合は、Ackを待たずに終了処理を行う
+                        if (self.dupTimeout <= 0 && [flow.qosLevel intValue] == MQTTQosLevelAtLeastOnce) {
+                            NSError *error = nil;
+                            if ([self encode:message]) {
+                                if ([self.delegate respondsToSelector:@selector(messageDelivered:msgID:)]) {
+                                    [self.delegate messageDelivered:self msgID:[flow.messageId intValue]];
+                                }
+                                if ([self.delegate respondsToSelector:@selector(messageDelivered:msgID:topic:data:qos:retainFlag:)]) {
+                                    [self.delegate messageDelivered:self
+                                                              msgID:[flow.messageId intValue]
+                                                              topic:flow.topic
+                                                               data:flow.data
+                                                                qos:[flow.qosLevel intValue]
+                                                         retainFlag:[flow.retainedFlag boolValue]];
+                                }
+                                if (self.synchronPub && self.synchronPubMid == [flow.messageId intValue]) {
+                                    self.synchronPub = FALSE;
+                                }
+                            } else {
+                                error = [NSError errorWithDomain:MQTTSessionErrorDomain
+                                                            code:MQTTSessionErrorEncoderNotReady
+                                                        userInfo:@{NSLocalizedDescriptionKey : @"Encoder not ready"}];
+                            }
+                            MQTTPublishHandler publishHandler = [self.publishHandlers objectForKey:@([flow.messageId intValue])];
+                            if (publishHandler) {
+                                [self.publishHandlers removeObjectForKey:@([flow.messageId intValue])];
+                                [self onPublish:publishHandler error:error];
+                            }
+                            [self.persistence deleteFlow:flow];
                             [self.persistence sync];
-                            windowSize++;
+                        } else {
+                            if ([self encode:message]) {
+                                flow.commandType = @(MQTTPublish);
+                                flow.deadline = [NSDate dateWithTimeIntervalSinceNow:self.dupTimeout];
+                                [self.persistence sync];
+                                windowSize++;
+                            }
                         }
                     }
                     break;
@@ -738,7 +800,9 @@ NSString * const MQTTSessionErrorDomain = @"MQTT";
                         [self handlePublish:message];
                         break;
                     case MQTTPuback:
-                        [self handlePuback:message];
+                        if (0 < self.dupTimeout) {
+                            [self handlePuback:message];
+                        }
                         break;
                     case MQTTPubrec:
                         [self handlePubrec:message];
